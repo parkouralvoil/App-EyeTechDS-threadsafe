@@ -1,15 +1,15 @@
 import argparse
+import threading
 
 from sys import argv
 from pylsl import StreamInfo, StreamOutlet, local_clock
-from .quicklink_types import QLDeviceId, QLDeviceInfo, QL_ERROR_OK, QLFrameData, errorToString
-
+from .quicklink_types import QLDeviceId, QLDeviceInfo, QL_ERROR_OK, QLFrameData, errorToString, QL_ERROR_TIMEOUT_ELAPSED
 from ctypes import CDLL, pointer
 from .utils import getDataSampleFromFrame, getImageSampleFromFrame, initDataOutlet, initVideoOutlet
 from .constants import CHANNEL_METADATA, CHANNEL_NAMES, DEFAULT_CONFIG_FILENAME, EXAMPLE_CONFIG_FILENAME, QUICKLINK_POLL_TIME_MS
 from .utils import initQuicklink2
 
-def run(quicklink2_api: CDLL, device_info: QLDeviceInfo, device_id: QLDeviceId, srate: int, video: bool, verbose: bool):
+def run(quicklink2_api: CDLL, device_info: QLDeviceInfo, device_id: QLDeviceId, srate: int, video: bool, verbose: bool, stop_event: threading.Event):
     device_serial_number = device_info.serialNumber.decode("utf-8")
     frame = (QLFrameData)()
     frame_ptr = pointer(frame)
@@ -18,18 +18,28 @@ def run(quicklink2_api: CDLL, device_info: QLDeviceInfo, device_id: QLDeviceId, 
     data_outlet = initDataOutlet(serial_number=device_serial_number, srate=srate)
     
     def getFrame():
-        # Blocking call
+        # Blocking call but returns False on timeout so we can re-check stop_event
         ret_val = quicklink2_api.QLDevice_GetFrame(device_id, QUICKLINK_POLL_TIME_MS, frame_ptr)
-        if (ret_val != QL_ERROR_OK):
-            raise ValueError(errorToString(ret_val))
-        return True
+        if ret_val == QL_ERROR_OK:
+            return True
+        if ret_val == QL_ERROR_TIMEOUT_ELAPSED:
+            return False
+        raise ValueError(errorToString(ret_val))
 
     # The image dimensions (=> LSL channel size) can only be determined after we receive the first frame
     video_outlet = None
-    if video and getFrame():
-        dims = frame.ImageData.Height, frame.ImageData.Width
-        video_outlet = initVideoOutlet(serial_number=device_serial_number, dims=dims)
-    while getFrame():
+    if video:
+        # wait for first valid frame but allow stop_event to interrupt the wait
+        while not (stop_event and stop_event.is_set()):
+            if getFrame():
+                dims = frame.ImageData.Height, frame.ImageData.Width
+                video_outlet = initVideoOutlet(serial_number=device_serial_number, dims=dims)
+                break
+
+    while not (stop_event and stop_event.is_set()):
+        if not getFrame():
+            # timeout, re-check stop_event and continue
+            continue
         sample = getDataSampleFromFrame(frame)
         data_outlet.push_sample(sample)
         
@@ -41,7 +51,7 @@ def run(quicklink2_api: CDLL, device_info: QLDeviceInfo, device_id: QLDeviceId, 
             print(f"Pushed sample #{received_samples}:\n{sample_dict}\n")
         received_samples += 1
 
-def init(srate=60, config_filename=DEFAULT_CONFIG_FILENAME, video=False, verbose=False):
+def init(srate=60, config_filename=DEFAULT_CONFIG_FILENAME, video=False, verbose=False, stop_event=None):
     quicklink2_api, device_info, device_id = initQuicklink2()
     try:
         run(quicklink2_api=quicklink2_api, 
@@ -49,10 +59,38 @@ def init(srate=60, config_filename=DEFAULT_CONFIG_FILENAME, video=False, verbose
             device_id=device_id,
             srate=srate,
             video=video,
-            verbose=verbose)
+            verbose=verbose,
+            stop_event=stop_event)
     except KeyboardInterrupt:
         print("Shutdown signal received. Stopping Quicklink2...")
+    finally:
+        # Ensure device is always stopped when init returns
         ret = quicklink2_api.QLDevice_Stop_All()
         if(ret != QL_ERROR_OK):
             raise ValueError(errorToString(ret))
         print("Shutdown complete.")
+
+class StreamController:
+    def __init__(self, thread: threading.Thread, stop_event: threading.Event):
+        self._thread = thread
+        self._stop_event = stop_event
+
+    def stop(self, timeout: float = None):
+        self._stop_event.set()
+        self._thread.join(timeout)
+
+    def join(self, timeout: float = None):
+        self._thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+def start(srate=60, config_filename=DEFAULT_CONFIG_FILENAME, video=False, verbose=False) -> StreamController:
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=init,
+        kwargs=dict(srate=srate, config_filename=config_filename, video=video, verbose=verbose, stop_event=stop_event),
+        daemon=True
+    )
+    t.start()
+    return StreamController(t, stop_event)
